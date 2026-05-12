@@ -11,6 +11,8 @@
 #include "HAL/IConsoleManager.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "Containers/Ticker.h"
+#include "GameFramework/HUD.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogClientDemos, Log, All);
 
@@ -130,6 +132,13 @@ void UClientDemoRecorder::HandleDemoRec(const TArray<FString>& Args)
 	TArray<FString> Options;
 	Options.Add(TEXT("ReplayStreamerOverride=NullNetworkReplayStreaming"));
 
+	// Embed a UT game mode class path so SpawnDemoRecSpectator can find AUTDemoRecSpectator during playback.
+	// On clients, GameState->GameModeClass is often null (especially for custom modes like ElimPlus/TeamArena).
+	// The engine falls back to URL option "game=" (DemoNetDriver.cpp:2333).
+	// All UT game modes inherit UTBaseGameMode which sets ReplaySpectatorPlayerControllerClass = AUTDemoRecSpectator.
+	// We just need any UT game mode class — UTDMGameMode is always available and lightweight.
+	Options.Add(TEXT("game=/Script/UnrealTournament.UTDMGameMode"));
+
 	UE_LOG(LogClientDemos, Warning, TEXT("demorec: Starting local recording '%s' World=%s GI=%s"),
 		*DemoName, *World->GetName(), *GI->GetName());
 
@@ -145,8 +154,9 @@ void UClientDemoRecorder::HandleDemoRec(const TArray<FString>& Args)
 	// Check result
 	if (World->DemoNetDriver)
 	{
-		UE_LOG(LogClientDemos, Warning, TEXT("demorec: Post-call DemoNetDriver exists, IsRecording=%d IsPlaying=%d"),
-			World->DemoNetDriver->IsRecording(), World->DemoNetDriver->IsPlaying());
+		UE_LOG(LogClientDemos, Warning, TEXT("demorec: Post-call DemoNetDriver exists, IsRecording=%d IsPlaying=%d Class=%s"),
+			World->DemoNetDriver->IsRecording(), World->DemoNetDriver->IsPlaying(),
+			*World->DemoNetDriver->GetClass()->GetName());
 	}
 	else
 	{
@@ -162,6 +172,12 @@ void UClientDemoRecorder::HandleDemoRec(const TArray<FString>& Args)
 	{
 		bIsRecordingClientDemo = true;
 		CurrentDemoName = DemoName;
+
+		// Reduce checkpoint frequency and spread checkpoint work across frames to minimize spikes.
+		// Default is every 30s with no per-frame limit (full serialize in one frame = big spike).
+		// Push to every 300s and cap at 0.5ms/frame to eliminate visible hitches on 480Hz.
+		IConsoleManager::Get().FindConsoleVariable(TEXT("demo.CheckpointUploadDelayInSeconds"))->Set(300.0f);
+		IConsoleManager::Get().FindConsoleVariable(TEXT("demo.CheckpointSaveMaxMSPerFrameOverride"))->Set(0.5f);
 
 		FString DemoPath = FPaths::Combine(*FPaths::GameSavedDir(), TEXT("Demos"), *DemoName);
 		UE_LOG(LogClientDemos, Log, TEXT("Recording demo '%s' to: %s"), *DemoName, *DemoPath);
@@ -211,6 +227,10 @@ void UClientDemoRecorder::HandleDemoStop()
 		}
 		return;
 	}
+
+	// Restore default checkpoint settings
+	IConsoleManager::Get().FindConsoleVariable(TEXT("demo.CheckpointUploadDelayInSeconds"))->Set(30.0f);
+	IConsoleManager::Get().FindConsoleVariable(TEXT("demo.CheckpointSaveMaxMSPerFrameOverride"))->Set(-1.0f);
 
 	if (World)
 	{
@@ -278,6 +298,63 @@ void UClientDemoRecorder::HandleDemoStatus()
 	}
 }
 
+bool UClientDemoRecorder::TickThrottle(float DeltaSeconds)
+{
+	// Throttle disabled — PauseRecording breaks DemoCurrentTime accumulation,
+	// causing fast-motion playback. RecordHz + checkpoint tuning is sufficient.
+	return false;
+}
+
+bool UClientDemoRecorder::TickPlaybackHUD(float DeltaSeconds)
+{
+	PlaybackHUDWaitTime += DeltaSeconds;
+
+	// Timeout after 10 seconds
+	if (PlaybackHUDWaitTime > 10.0f)
+	{
+		UE_LOG(LogClientDemos, Warning, TEXT("clientdemoplay: Timed out waiting for spectator PC to create HUD."));
+		return false;
+	}
+
+	UWorld* World = GetCurrentWorld();
+	if (!World || !World->DemoNetDriver || !World->DemoNetDriver->IsPlaying())
+	{
+		return true; // Replay world not ready yet, keep polling
+	}
+
+	APlayerController* PC = World->GetFirstPlayerController();
+	if (!PC)
+	{
+		return true; // PC not replicated yet, keep polling
+	}
+
+	// If HUD already exists, we're done
+	if (PC->MyHUD)
+	{
+		UE_LOG(LogClientDemos, Log, TEXT("clientdemoplay: HUD already exists (%s), no fix needed."), *PC->MyHUD->GetClass()->GetName());
+		return false;
+	}
+
+	// Load AUTHUD by path — avoids module dependency on UnrealTournament
+	static UClass* UTHUDClass = nullptr;
+	if (!UTHUDClass)
+	{
+		UTHUDClass = StaticLoadClass(AHUD::StaticClass(), nullptr, TEXT("/Script/UnrealTournament.UTHUD"));
+	}
+
+	if (UTHUDClass)
+	{
+		PC->ClientSetHUD(UTHUDClass);
+		UE_LOG(LogClientDemos, Log, TEXT("clientdemoplay: Force-created AUTHUD for replay spectator."));
+	}
+	else
+	{
+		UE_LOG(LogClientDemos, Warning, TEXT("clientdemoplay: Failed to load AUTHUD class."));
+	}
+
+	return false; // Done, remove ticker
+}
+
 void UClientDemoRecorder::HandleDemoPlay(const TArray<FString>& Args)
 {
 	if (Args.Num() == 0 || Args[0].IsEmpty())
@@ -318,6 +395,14 @@ void UClientDemoRecorder::HandleDemoPlay(const TArray<FString>& Args)
 	UE_LOG(LogClientDemos, Warning, TEXT("clientdemoplay: Playing back '%s' with local streamer"), *DemoName);
 
 	GI->PlayReplay(DemoName, nullptr, Options);
+
+	// Start polling for the spectator PC — once the replay world loads and the PC replicates,
+	// we force-create the AUTHUD since HUDClass is COND_OwnerOnly and won't replicate during playback.
+	PlaybackHUDWaitTime = 0.0f;
+	PlaybackHUDTickHandle = FTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateUObject(this, &UClientDemoRecorder::TickPlaybackHUD),
+		0.1f // Check every 100ms
+	);
 }
 
 FString UClientDemoRecorder::MakeDefaultDemoName() const
